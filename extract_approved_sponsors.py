@@ -85,6 +85,57 @@ def extract_sponsors(pdf_path: Path) -> list[dict[str, object]]:
     return records
 
 
+BARE_SUFFIXES = {
+    "inc",
+    "ltd",
+    "pty ltd",
+    "pty limited",
+    "limited",
+    "llc",
+    "co",
+    "corp",
+    "corporation",
+    "pl",
+    "p/l",
+    "inc.",
+    "ltd.",
+    "co.",
+    "corp.",
+}
+
+
+def merge_wrapped_suffixes(
+    records: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Merge a bare corporate-suffix line (e.g. 'INC') into the previous
+    record when the PDF has wrapped a long company name across two lines.
+    """
+    merged: list[dict[str, object]] = []
+
+    for record in records:
+        name = str(record["Sponsor Name"]).strip()
+        lower = name.casefold()
+
+        if (
+            merged
+            and lower in BARE_SUFFIXES
+            and merged[-1]["PDF Page"] == record["PDF Page"]
+        ):
+            prev_name = str(merged[-1]["Sponsor Name"]).strip()
+            if not prev_name.casefold().rstrip(".").endswith(
+                tuple(s.rstrip(".") for s in BARE_SUFFIXES)
+            ):
+                merged[-1]["Sponsor Name"] = f"{prev_name} {name}"
+                continue
+
+        merged.append(dict(record))
+
+    for index, record in enumerate(merged, start=1):
+        record["Source Order"] = index
+
+    return merged
+
+
 def unique_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
     seen: set[str] = set()
     output: list[dict[str, object]] = []
@@ -178,6 +229,7 @@ def main() -> None:
         raise FileNotFoundError(f"Input PDF was not found: {args.pdf}")
 
     records = extract_sponsors(args.pdf)
+    records = merge_wrapped_suffixes(records)
     if args.unique:
         records = unique_records(records)
     write_excel(records, args.output)
