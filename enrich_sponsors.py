@@ -2,27 +2,38 @@
 Phase 2: enrich approved-sponsor company names with website, Australian state,
 industry, and a confidence rating based on independent source agreement.
 
-Pipeline (free, no ABN/ABR lookups, no paid APIs):
+REVISION NOTE (v2): the first version of this script used Gemini for every
+company. In practice the free-tier daily quota turned out to be 20
+requests/day (not the 1,500/day the docs implied) - completely unworkable at
+3,389 companies. v2 removes that bottleneck: extraction is done with
+deterministic rules directly from search results by default, so there is no
+API quota at all. Gemini becomes optional (--use-llm) as a slow bonus pass
+you can run later just on the leftover unresolved rows if you want to.
+
+Pipeline (free, no ABN/ABR lookups):
   Tier 0 - Wikidata: official, structured, zero-cost lookup for companies that
            already have a Wikidata entry (mostly large/well-known corporates).
-  Tier 1 - DuckDuckGo web search (unofficial, free) -> top N organic results
-           are handed to a free-tier Gemini model, which is only allowed to
-           extract facts from those results (never from its own memory).
-           Confidence is derived from how many independent result domains
-           agree on the same website/state/industry.
+  Tier 1 - DuckDuckGo web search (unofficial, free) -> results are filtered
+           against a blacklist of directories/social sites, and the top
+           remaining result is taken as the likely official site. Confidence
+           comes from (a) whether the search engine ranked it first among
+           real candidates and (b) whether another independent result
+           separately mentions the same domain.
   Tier 2 - Unresolved: no usable/agreeing evidence found. Recorded honestly
            rather than guessed.
+  Optional bonus pass (--use-llm): re-examines only rows still Low/None after
+           Tier 1, using a free-tier Gemini call per row. Capped hard at the
+           real observed daily quota so it can't crash the whole run.
 
 Checkpointing: every company's result is committed to a local SQLite database
 the moment it's produced, so the script can be killed (Ctrl+C, power loss,
-daily rate-limit cutoff) at any time and simply resumed later with the same
-command - already-processed companies are skipped automatically.
+network blip) at any time and simply resumed later with the same command -
+already-processed companies are skipped automatically.
 
 Setup (one-time):
-    pip install ddgs google-genai openpyxl
-    Get a free API key from https://aistudio.google.com/apikey (no card needed)
-    Windows (PowerShell):  $env:GEMINI_API_KEY = "your-key-here"
-    Or create a .env-style file and load it however you prefer.
+    pip install ddgs openpyxl
+    (only needed if you use --use-llm:  pip install google-genai
+     and get a free key from https://aistudio.google.com/apikey)
 
 Usage:
     python enrich_sponsors.py --input approved_sponsors_unique.xlsx --output enriched_sponsors.xlsx
@@ -31,12 +42,15 @@ Usage:
     Optional flags:
     --limit 50          process only the first 50 unprocessed companies (good for a test run)
     --db enrichment.db  custom checkpoint database path (default: enrichment.db)
-    --skip-wikidata     skip Tier 0 and go straight to search+LLM for every row
+    --skip-wikidata     skip Tier 0 and go straight to search-based extraction
+    --use-llm           add the optional Gemini bonus pass on Low/None rows
+                         (requires GEMINI_API_KEY env var; capped at 20/day)
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import random
@@ -54,45 +68,62 @@ from openpyxl import Workbook, load_workbook
 # Configuration
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL = "gemini-2.5-flash-lite"  # cheapest/most generous free-tier model
-# If this model name is retired by the time you run this, check
-# https://ai.google.dev/gemini-api/docs/models for the current Flash-Lite id
-# and update the line above - nothing else in this script needs to change.
-
-MAX_SEARCH_RESULTS = 5
-GEMINI_MIN_DELAY_SECONDS = 4.5   # keeps us comfortably under free-tier RPM caps
+MAX_SEARCH_RESULTS = 6
 DDG_MIN_DELAY_SECONDS = 2.0
-MAX_CONSECUTIVE_ERRORS = 8       # stop the run cleanly if something is broken
 
-AUS_STATES = {
-    "NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT", "Unknown",
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MIN_DELAY_SECONDS = 4.5
+# Observed empirically from a real run's 429 error - do not trust published
+# docs here, they were wrong. Update this if your own account's error message
+# reports a different number.
+GEMINI_FREE_RPD = 20
+
+MAX_CONSECUTIVE_ERRORS = 8
+
+AUS_STATES = ["NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"]
+
+STATE_KEYWORDS = {
+    "NSW": ["new south wales", "nsw", "sydney", "newcastle", "wollongong"],
+    "VIC": ["victoria", "vic", "melbourne", "geelong", "ballarat"],
+    "QLD": ["queensland", "qld", "brisbane", "gold coast", "townsville", "cairns"],
+    "WA": ["western australia", " wa ", "perth", "fremantle"],
+    "SA": ["south australia", " sa ", "adelaide"],
+    "TAS": ["tasmania", "tas", "hobart", "launceston"],
+    "ACT": ["australian capital territory", "canberra", " act "],
+    "NT": ["northern territory", "darwin", " nt "],
 }
 
-# ANZSIC-style top-level industry divisions - official Australian standard,
-# used so results stay consistent across ~3,400 rows instead of the model
-# inventing a new industry label every time.
-INDUSTRY_DIVISIONS = [
-    "Agriculture, Forestry and Fishing",
-    "Mining",
-    "Manufacturing",
-    "Electricity, Gas, Water and Waste Services",
-    "Construction",
-    "Wholesale Trade",
-    "Retail Trade",
-    "Accommodation and Food Services",
-    "Transport, Postal and Warehousing",
-    "Information Media and Telecommunications",
-    "Financial and Insurance Services",
-    "Rental, Hiring and Real Estate Services",
-    "Professional, Scientific and Technical Services",
-    "Administrative and Support Services",
-    "Public Administration and Safety",
-    "Education and Training",
-    "Health Care and Social Assistance",
-    "Arts and Recreation Services",
-    "Other Services",
-    "Unknown",
-]
+INDUSTRY_KEYWORDS = {
+    "Agriculture, Forestry and Fishing": ["farm", "agricult", "forestry", "fishing", "livestock", "crop"],
+    "Mining": ["mining", "mine ", "mineral", "coal", "resources ltd", "exploration"],
+    "Manufacturing": ["manufactur", "factory", "production plant", "fabrication"],
+    "Electricity, Gas, Water and Waste Services": ["electricity", "energy supply", "gas supply", "water utility", "waste management", "recycling"],
+    "Construction": ["construction", "builders", "building contractor", "civil works", "engineering construction"],
+    "Wholesale Trade": ["wholesale", "distributor", "supplier of"],
+    "Retail Trade": ["retail", "store", "supermarket", "shop "],
+    "Accommodation and Food Services": ["hotel", "restaurant", "cafe", "accommodation", "catering", "hospitality"],
+    "Transport, Postal and Warehousing": ["transport", "logistics", "freight", "shipping", "warehousing", "courier"],
+    "Information Media and Telecommunications": ["software", "telecommunicat", "media company", "broadcasting", "IT services", "technology solutions"],
+    "Financial and Insurance Services": ["bank", "banking", "insurance", "financial services", "superannuation", "investment fund"],
+    "Rental, Hiring and Real Estate Services": ["real estate", "property management", "leasing", "rental services"],
+    "Professional, Scientific and Technical Services": ["consulting", "engineering services", "law firm", "legal services", "accounting firm", "scientific research", "architecture"],
+    "Administrative and Support Services": ["administrative services", "labour hire", "recruitment", "cleaning services", "security services"],
+    "Public Administration and Safety": ["government department", "council", "local government", "public service", "defence force", "police"],
+    "Education and Training": ["school", "college", "university", "tafe", "training provider", "education"],
+    "Health Care and Social Assistance": ["hospital", "health care", "medical centre", "aged care", "disability services", "clinic"],
+    "Arts and Recreation Services": ["museum", "gallery", "theatre", "sporting club", "recreation centre", "arts organisation"],
+}
+
+DIRECTORY_DOMAINS = {
+    "facebook.com", "linkedin.com", "instagram.com", "twitter.com", "x.com",
+    "youtube.com", "tiktok.com", "yellowpages.com.au", "truelocal.com.au",
+    "whitepages.com.au", "hotfrog.com.au", "startlocal.com.au", "yelp.com",
+    "seek.com.au", "indeed.com", "glassdoor.com", "glassdoor.com.au",
+    "crunchbase.com", "bloomberg.com", "dnb.com", "opencorporates.com",
+    "zoominfo.com", "rocketreach.co", "apollo.io", "wikipedia.org",
+    "wikidata.org", "google.com", "abr.business.gov.au", "abn.business.gov.au",
+    "informdirect.com.au", "quickbusinesssearch.com.au", "cluey.com.au",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -179,16 +210,13 @@ def wikidata_lookup(name: str) -> dict | None:
             return None
 
         qid = hits[0]["id"]
-        entity_url = (
-            f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
-        )
+        entity_url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
         req2 = urllib.request.Request(entity_url, headers={"User-Agent": "SponsorEnrichment/1.0"})
         with urllib.request.urlopen(req2, timeout=15) as resp2:
             entity_data = json.loads(resp2.read().decode("utf-8"))
 
         claims = entity_data["entities"][qid]["claims"]
 
-        # P17 = country; require Australia (Q408) for a confident match
         country_claims = claims.get("P17", [])
         is_australian = any(
             c["mainsnak"]["datavalue"]["value"]["id"] == "Q408"
@@ -203,11 +231,11 @@ def wikidata_lookup(name: str) -> dict | None:
             website = claims["P856"][0]["mainsnak"]["datavalue"]["value"]
 
         if not website:
-            return None  # not useful enough without a website
+            return None
 
         return {
             "website": website,
-            "state": "Unknown",  # Wikidata rarely encodes AU state cleanly; leave for manual/LLM pass if needed
+            "state": "Unknown",
             "industry": "Unknown",
             "confidence": "High",
             "confidence_reason": "Matched an Australian entity on Wikidata with an official website property (P856).",
@@ -220,7 +248,7 @@ def wikidata_lookup(name: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 1: DuckDuckGo search + Gemini extraction
+# Tier 1: DuckDuckGo search + rule-based extraction (no LLM, no quota)
 # ---------------------------------------------------------------------------
 
 def ddg_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[dict]:
@@ -229,11 +257,7 @@ def ddg_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[dict]:
     with DDGS() as ddgs:
         results = list(ddgs.text(query, max_results=max_results))
     return [
-        {
-            "title": r.get("title", ""),
-            "href": r.get("href", ""),
-            "body": r.get("body", ""),
-        }
+        {"title": r.get("title", ""), "href": r.get("href", ""), "body": r.get("body", "")}
         for r in results
     ]
 
@@ -246,37 +270,147 @@ def domain_of(url: str) -> str:
         return ""
 
 
-def build_prompt(name: str, results: list[dict]) -> str:
+def clean_name(name: str) -> str:
+    n = name.lower()
+    n = re.sub(r"\((.*?)\)", " ", n)  # drop parenthetical qualifiers e.g. "(Australia)"
+    n = re.sub(
+        r"\b(pty\.?\s*ltd\.?|pty\.?\s*limited|limited|ltd\.?|incorporated|inc\.?|holdings?|group)\b",
+        " ", n,
+    )
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def detect_state(combined_text: str) -> str:
+    scores = {}
+    for state, keywords in STATE_KEYWORDS.items():
+        scores[state] = sum(combined_text.count(kw) for kw in keywords)
+    best_state = max(scores, key=scores.get)
+    return best_state if scores[best_state] > 0 else "Unknown"
+
+
+def detect_industry(combined_text: str) -> str:
+    scores = {}
+    for industry, keywords in INDUSTRY_KEYWORDS.items():
+        scores[industry] = sum(combined_text.count(kw) for kw in keywords)
+    best_industry = max(scores, key=scores.get)
+    return best_industry if scores[best_industry] > 0 else "Unknown"
+
+
+def heuristic_extract(name: str, results: list[dict]) -> dict:
+    """Pick the likely official site using DuckDuckGo's own relevance ranking
+    (a real signal - don't discard it in favour of naive string matching,
+    which fails badly on acronym-style domains like 'ems.com.au') plus a
+    check for independent corroboration."""
+
+    candidates = [r for r in results if domain_of(r["href"]) not in DIRECTORY_DOMAINS]
+
+    combined_text = " ".join(f"{r.get('title', '')} {r.get('body', '')}" for r in results).lower()
+    state = detect_state(combined_text)
+    industry = detect_industry(combined_text)
+
+    if not candidates:
+        return {
+            "website": None, "state": state, "industry": industry,
+            "confidence": "None", "confidence_reason": "No non-directory search results found.",
+            "resolved_by": "search-heuristic", "status": "unresolved",
+            "raw_response": {"results": results},
+        }
+
+    top = candidates[0]
+    target_domain = domain_of(top["href"])
+
+    corroborated_by = [
+        r for r in results
+        if r is not top and target_domain and target_domain in f"{r.get('title','')} {r.get('body','')}".lower()
+    ]
+
+    cleaned = clean_name(name).replace(" ", "")
+    base = target_domain.split(".")[0]
+    similarity = difflib.SequenceMatcher(None, cleaned, base).ratio() if cleaned and base else 0.0
+
+    if corroborated_by:
+        confidence = "High"
+        reason = (
+            f"DuckDuckGo's top non-directory result was {target_domain}, and "
+            f"{len(corroborated_by)} separate result(s) independently mention it too."
+        )
+        status = "done"
+    elif similarity >= 0.4 or len(candidates) == 1:
+        confidence = "Medium"
+        reason = f"DuckDuckGo's top non-directory result was {target_domain}, not independently corroborated elsewhere in these results."
+        status = "done"
+    else:
+        confidence = "Low"
+        reason = (
+            f"Top non-directory result was {target_domain}, but it doesn't closely "
+            "resemble the company name and isn't corroborated - verify manually."
+        )
+        status = "unresolved"
+
+    return {
+        "website": target_domain,
+        "state": state,
+        "industry": industry,
+        "confidence": confidence,
+        "confidence_reason": reason,
+        "resolved_by": "search-heuristic",
+        "status": status,
+        "raw_response": {"results": results, "similarity": round(similarity, 2)},
+    }
+
+
+def enrich_via_search(name: str) -> dict:
+    query = f"{name} Australia"  # NOTE: no exact-phrase quotes - that was the v1 bug
+    results = ddg_search(query)
+
+    if not results:
+        cleaned = clean_name(name)
+        if cleaned and cleaned.lower() != name.lower():
+            time.sleep(DDG_MIN_DELAY_SECONDS)
+            results = ddg_search(f"{cleaned} Australia")
+
+    if not results:
+        return {
+            "website": None, "state": "Unknown", "industry": "Unknown",
+            "confidence": "None", "confidence_reason": "No search results returned for this company.",
+            "resolved_by": "search-heuristic", "status": "unresolved",
+            "raw_response": None,
+        }
+
+    return heuristic_extract(name, results)
+
+
+# ---------------------------------------------------------------------------
+# Optional bonus pass: Gemini LLM re-check for Low/None rows only
+# ---------------------------------------------------------------------------
+
+INDUSTRY_DIVISIONS = list(INDUSTRY_KEYWORDS.keys()) + ["Other Services", "Unknown"]
+
+
+def build_llm_prompt(name: str, results: list[dict]) -> str:
     snippets_text = "\n\n".join(
-        f"[Result {i+1}] {r['title']}\nURL: {r['href']}\n{r['body']}"
+        f"[Result {i + 1}] {r['title']}\nURL: {r['href']}\n{r['body']}"
         for i, r in enumerate(results)
     )
-    states_list = ", ".join(sorted(AUS_STATES - {"Unknown"}))
+    states_list = ", ".join(AUS_STATES + ["Unknown"])
     industries_list = "\n".join(f"- {i}" for i in INDUSTRY_DIVISIONS)
-
     return f"""You are extracting factual data about an Australian company from search results only.
-Company name (from an Australian government approved-sponsor list): "{name}"
+Company name: "{name}"
 
 Search results:
 {snippets_text}
 
 Rules:
-- Use ONLY the information present in the search results above. Do not use outside knowledge.
-- If the results don't clearly identify the company, say so - do not guess.
-- "website" must be the company's own official domain (not a directory, LinkedIn, Facebook, or news site), or null.
-- "state" must be one of: {states_list}, or "Unknown" if not determinable.
-- "industry" must be exactly one of these standard categories:
+- Use ONLY the information present in the search results above.
+- If unclear, say so - do not guess.
+- "website" must be the company's own official domain (not a directory/social/news site), or null.
+- "state" must be one of: {states_list}.
+- "industry" must be exactly one of:
 {industries_list}
-- "supporting_result_indices" must list which of the numbered results (1-based) support your website answer.
 
-Respond with ONLY this JSON object, no other text:
-{{
-  "website": "example.com.au or null",
-  "state": "one of the allowed values",
-  "industry": "one of the allowed categories",
-  "supporting_result_indices": [1, 2],
-  "reasoning": "one short sentence"
-}}"""
+Respond with ONLY this JSON object:
+{{"website": "example.com.au or null", "state": "...", "industry": "...", "reasoning": "one short sentence"}}"""
 
 
 def call_gemini(client, prompt: str) -> dict:
@@ -286,99 +420,61 @@ def call_gemini(client, prompt: str) -> dict:
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
-            temperature=0.0,
-            max_output_tokens=400,
-            response_mime_type="application/json",
+            temperature=0.0, max_output_tokens=300, response_mime_type="application/json",
         ),
     )
-    text = response.text.strip()
-    text = re.sub(r"^```json|```$", "", text, flags=re.MULTILINE).strip()
+    text = re.sub(r"^```json|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
     return json.loads(text)
 
 
-def compute_confidence(extracted: dict, results: list[dict]) -> tuple[str, str]:
-    """Confidence reflects genuine independent corroboration: does the claimed
-    website itself show up in results, AND is it separately mentioned by a
-    different domain (directory, news, etc.)? Two pages from the same site
-    are not independent evidence of each other."""
-    website = (extracted.get("website") or "").strip().lower()
-    if not website or website == "null":
-        return "None", "No website could be identified from the search results."
+def llm_bonus_pass(conn: sqlite3.Connection, client, daily_cap: int) -> None:
+    rows = conn.execute(
+        "SELECT source_order, sponsor_name, raw_response FROM enrichment "
+        "WHERE confidence IN ('Low', 'None') ORDER BY source_order"
+    ).fetchall()
 
-    target_domain = domain_of(website if website.startswith("http") else f"https://{website}")
-    if not target_domain:
-        target_domain = website.replace("https://", "").replace("http://", "").strip("/")
+    print(f"\nBonus LLM pass: {len(rows):,} rows currently Low/None confidence. "
+          f"Processing up to {daily_cap} today (real observed free-tier daily cap).")
 
-    official_domain_present = any(domain_of(r["href"]) == target_domain for r in results)
+    calls_made = 0
+    for source_order, name, raw_response_json in rows:
+        if calls_made >= daily_cap:
+            print(f"Hit the {daily_cap}/day cap - re-run with --use-llm again tomorrow to continue.")
+            break
+        try:
+            raw = json.loads(raw_response_json) if raw_response_json else {}
+            results = raw.get("results") or []
+            if not results:
+                continue
 
-    third_party_domains = set()
-    for r in results:
-        d = domain_of(r["href"])
-        if not d or d == target_domain:
-            continue
-        text = f"{r.get('title', '')} {r.get('body', '')}".lower()
-        if target_domain in text:
-            third_party_domains.add(d)
+            prompt = build_llm_prompt(name, results)
+            extracted = call_gemini(client, prompt)
+            calls_made += 1
+            time.sleep(GEMINI_MIN_DELAY_SECONDS + random.uniform(0, 1.5))
 
-    if official_domain_present and third_party_domains:
-        return (
-            "High",
-            f"The official site ({target_domain}) appeared directly, and "
-            f"{len(third_party_domains)} independent source(s) separately mention it.",
-        )
-    if official_domain_present:
-        return (
-            "Medium",
-            f"{target_domain} appeared in search results but no independent "
-            "third-party source corroborates it.",
-        )
-    if len(third_party_domains) >= 2:
-        return (
-            "Medium",
-            f"{len(third_party_domains)} independent sources mention {target_domain}, "
-            "but the site itself wasn't directly indexed in these results.",
-        )
-    if len(third_party_domains) == 1:
-        return "Low", f"Only one indirect mention of {target_domain}; not corroborated."
-    return "Low", "Model proposed a website but it isn't backed by the supplied search results."
+            website = extracted.get("website")
+            if isinstance(website, str) and website.strip().lower() == "null":
+                website = None
+            status = "done" if website else "unresolved"
+            confidence = "Medium" if website else "None"
 
+            save_result(conn, source_order, name, {
+                "website": website,
+                "state": extracted.get("state", "Unknown"),
+                "industry": extracted.get("industry", "Unknown"),
+                "confidence": confidence,
+                "confidence_reason": "Re-evaluated by Gemini bonus pass: " + str(extracted.get("reasoning", "")),
+                "resolved_by": "search+llm-bonus",
+                "status": status,
+                "raw_response": extracted,
+            })
+            print(f"[{source_order}] {name[:60]:<60} -> {confidence} (bonus pass)")
 
-def enrich_via_search(client, name: str) -> dict:
-    query = f'"{name}" Australia'
-    results = ddg_search(query)
-
-    if not results:
-        return {
-            "website": None,
-            "state": "Unknown",
-            "industry": "Unknown",
-            "confidence": "None",
-            "confidence_reason": "No search results returned.",
-            "resolved_by": "search+llm",
-            "status": "unresolved",
-            "raw_response": None,
-        }
-
-    prompt = build_prompt(name, results)
-    extracted = call_gemini(client, prompt)
-
-    confidence, reason = compute_confidence(extracted, results)
-    website = extracted.get("website")
-    if isinstance(website, str) and website.strip().lower() == "null":
-        website = None
-
-    status = "done" if confidence in ("High", "Medium") else "unresolved"
-
-    return {
-        "website": website,
-        "state": extracted.get("state", "Unknown"),
-        "industry": extracted.get("industry", "Unknown"),
-        "confidence": confidence,
-        "confidence_reason": reason,
-        "resolved_by": "search+llm",
-        "status": status,
-        "raw_response": extracted,
-    }
+        except Exception as exc:
+            print(f"[{source_order}] {name[:60]:<60} -> bonus pass ERROR: {exc}")
+            if "429" in str(exc) or "quota" in str(exc).lower():
+                print("Daily quota hit - re-run with --use-llm tomorrow to continue.")
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +509,7 @@ def export_to_excel(db_path: Path, output_path: Path) -> None:
     for row in rows:
         sheet.append(row)
 
-    widths = {"A": 12, "B": 55, "C": 30, "D": 10, "E": 35, "F": 12, "G": 55, "H": 14, "I": 12}
+    widths = {"A": 12, "B": 55, "C": 30, "D": 10, "E": 35, "F": 12, "G": 55, "H": 16, "I": 12}
     for col, width in widths.items():
         sheet.column_dimensions[col].width = width
     sheet.freeze_panes = "A2"
@@ -432,20 +528,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True, help="Output enriched xlsx.")
     parser.add_argument("--db", type=Path, default=Path("enrichment.db"), help="Checkpoint database path.")
     parser.add_argument("--limit", type=int, default=None, help="Only process this many new rows (test runs).")
-    parser.add_argument("--skip-wikidata", action="store_true", help="Skip Tier 0 and go straight to search+LLM.")
+    parser.add_argument("--skip-wikidata", action="store_true", help="Skip Tier 0, go straight to search.")
+    parser.add_argument("--use-llm", action="store_true", help="Run the optional Gemini bonus pass on Low/None rows.")
+    parser.add_argument("--llm-daily-cap", type=int, default=GEMINI_FREE_RPD, help="Cap for the bonus pass per run.")
     args = parser.parse_args()
-
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        sys.exit(
-            "GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set.\n"
-            "Get a free key from https://aistudio.google.com/apikey and set it, e.g.\n"
-            "  PowerShell: $env:GEMINI_API_KEY = \"your-key-here\"\n"
-            "  bash:       export GEMINI_API_KEY=\"your-key-here\""
-        )
-
-    from google import genai
-    client = genai.Client(api_key=api_key)
 
     conn = init_db(args.db)
     companies = load_companies(args.input)
@@ -469,15 +555,15 @@ def main() -> None:
                 time.sleep(DDG_MIN_DELAY_SECONDS)
 
             if result is None:
-                result = enrich_via_search(client, name)
-                time.sleep(GEMINI_MIN_DELAY_SECONDS + random.uniform(0, 1.5))
+                result = enrich_via_search(name)
+                time.sleep(DDG_MIN_DELAY_SECONDS + random.uniform(0, 1.0))
 
             save_result(conn, source_order, name, result)
             processed_this_run += 1
             consecutive_errors = 0
 
             status_flag = "OK" if result["status"] == "done" else "unresolved"
-            print(f"[{source_order}] {name[:60]:<60} -> {result.get('confidence','?'):<6} ({status_flag})")
+            print(f"[{source_order}] {name[:60]:<60} -> {result.get('confidence', '?'):<6} ({status_flag})")
 
         except KeyboardInterrupt:
             print("\nInterrupted by user. Progress is saved - re-run the same command to resume.")
@@ -486,14 +572,20 @@ def main() -> None:
         except Exception as exc:
             consecutive_errors += 1
             print(f"[{source_order}] {name[:60]:<60} -> ERROR: {exc}")
-            if "429" in str(exc) or "rate" in str(exc).lower() or "quota" in str(exc).lower():
-                print("Looks like a rate/quota limit was hit. Stopping cleanly - "
-                      "re-run this same command later (e.g. tomorrow) to resume.")
-                break
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                print(f"{MAX_CONSECUTIVE_ERRORS} consecutive errors - stopping to avoid burning quota on a broken run.")
+                print(f"{MAX_CONSECUTIVE_ERRORS} consecutive errors - stopping to check what's wrong "
+                      "(likely DuckDuckGo throttling - wait a while before resuming).")
                 break
             time.sleep(5)
+
+    if args.use_llm:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            print("\n--use-llm was set but GEMINI_API_KEY is not in your environment - skipping bonus pass.")
+        else:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            llm_bonus_pass(conn, client, args.llm_daily_cap)
 
     conn.close()
     export_to_excel(args.db, args.output)
